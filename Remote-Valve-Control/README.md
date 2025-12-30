@@ -1,254 +1,242 @@
-# Shelly Gen3 LoRa – Reliable Remote Valve Control
+# Remote Valve Control (Shelly Gen3 + LoRa)
 
-## Abstract
+## Summary
 
-This project implements a **reliable, bidirectional command-and-acknowledgment protocol** between two **Shelly 2 Gen3** devices using **LoRa**, designed to remotely control an electromechanical valve when the remote device has **no network connectivity**.
+This project implements a **reliable remote valve control** system using two **Shelly 2 Gen3** devices connected via **LoRa**:
 
-The solution addresses real-world LoRa constraints (half-duplex radio, packet loss, non-deterministic latency) and integrates natively with the **Shelly App** using **Virtual Components**, avoiding manual input, string commands, or cloud dependencies.
+* **MASTER**: user-facing controller (Shelly App + Virtual Components)
+* **SLAVE**: remote actuator controller (valve via Cover API)
 
----
-
-## Problem Statement
-
-Typical scenario:
-
-* **MASTER Shelly**
-
-  * Connected to LAN / Shelly App
-  * User-facing control device
-* **SLAVE Shelly**
-
-  * Physically connected to an electromechanical valve
-  * No Internet / LAN connectivity
-* Communication exclusively via **LoRa**
-
-Constraints:
-
-* LoRa is half-duplex
-* RX packets can be lost during TX windows
-* Latency is unpredictable
-* No guaranteed delivery
-
-A naive “send command once” approach is **not reliable**.
+The solution is designed for real-world LoRa constraints (half-duplex radio, packet loss, unpredictable latency) and provides a deterministic control flow with acknowledgments and execution confirmation.
 
 ---
 
-## Solution Overview
+## Use Case / Problem
 
-This project implements a **custom lightweight protocol** over LoRa with:
+A remote location must control an electromechanical valve but has **no Internet connectivity**.
 
-* Command correlation (`req` ID)
-* Explicit acknowledgment (`ACK`)
-* Execution confirmation (`DONE`)
-* Duplicate command handling (idempotency)
-* Burst-based retransmission (anti packet loss)
-* Long RX windows on the MASTER
+Requirements:
 
-The result is **deterministic behavior** even under unstable radio conditions.
-
----
-
-## Hardware Components
-
-| Component               | Role                   |
-| ----------------------- | ---------------------- |
-| Shelly 2 Gen3 (MASTER)  | User-facing controller |
-| Shelly 2 Gen3 (SLAVE)   | Valve controller       |
-| Shelly LoRa Add-on      | Radio communication    |
-| Electromechanical Valve | Final actuator         |
+* Command valve **open/close** from the Shelly App
+* Confirm that the remote device **received** the command
+* Confirm that the valve **actually reached** the expected final state
+* Operate reliably over LoRa despite packet loss and collisions
+* Avoid manual typing / RPC calls from the app (prevent user input mistakes)
 
 ---
 
-## Virtual Components (MASTER)
+## Hardware / Components
 
-Used to interact exclusively through the Shelly App.
-
-| Type            | ID            | Description                               |
-| --------------- | ------------- | ----------------------------------------- |
-| Virtual Button  | `button:200`  | Open valve                                |
-| Virtual Button  | `button:201`  | Close valve                               |
-| Virtual Boolean | `boolean:200` | Valve state (`true=open`, `false=closed`) |
-
-No string commands, no manual RPC calls required from the app.
+| Component                                | Role                                           |
+| ---------------------------------------- | ---------------------------------------------- |
+| Shelly 2 Gen3 (MASTER)                   | App-facing controller + LoRa sender/receiver   |
+| Shelly 2 Gen3 (SLAVE)                    | Remote valve controller + LoRa sender/receiver |
+| Shelly LoRa Add-on                       | Radio communication                            |
+| Electromechanical valve (via Cover mode) | Physical actuator                              |
 
 ---
 
-## Communication Protocol
+## Shelly App Integration (MASTER)
+
+The MASTER uses **Virtual Components** so the user can control the valve without typing any command:
+
+| Virtual Component |            ID | Meaning                                   |
+| ----------------- | ------------: | ----------------------------------------- |
+| Virtual Button    |  `button:200` | Open valve                                |
+| Virtual Button    |  `button:201` | Close valve                               |
+| Virtual Boolean   | `boolean:200` | Valve state (`true=open`, `false=closed`) |
+
+---
+
+## Protocol Overview
 
 ### Message Types
 
-| Type   | Description                |
-| ------ | -------------------------- |
-| `CMD`  | Command (`CO-OP`, `CO-CL`) |
-| `ACK`  | Command received           |
-| `DONE` | Command executed           |
-| `ERR`  | Execution error            |
+| Type   | Description                              |
+| ------ | ---------------------------------------- |
+| `CMD`  | Command: `CO-OP` (open), `CO-CL` (close) |
+| `ACK`  | Command received by SLAVE                |
+| `DONE` | Command executed; includes final state   |
+| `ERR`  | Execution error                          |
 
-Each message includes:
+Each message carries a unique correlation ID: `req`.
 
-* `req` → unique request ID
-* optional payload (`state`, `ok`, `err`)
+---
 
-### Packet Format
+## Robust Framing Format (v3)
 
-```json
-{
-  "body": "{...payload...}",
-  "chk": "XXXX"
-}
+LoRa can deliver **corrupted, truncated, or concatenated frames**.
+To prevent JSON parsing failures, this project uses a **framed payload** with length + checksum validation.
+
+### Frame Layout
+
+```
+~<LEN>:<PAYLOAD>|<CHK>#
 ```
 
-* `chk` = XOR checksum (hex, uppercase)
-* Payload is Base64-encoded for LoRa transmission
+* `~` start marker
+* `#` end marker
+* `<LEN>` decimal payload length
+* `<PAYLOAD>` key/value string (see below)
+* `<CHK>` XOR checksum (hex, uppercase) computed over `<PAYLOAD>`
+
+### Payload Layout
+
+Key-value pairs separated by `;`
+
+Examples:
+
+```
+t=CMD;cmd=CO-CL;req=33b3d75e
+t=ACK;req=33b3d75e
+t=DONE;req=33b3d75e;ok=1;state=closed
+t=ERR;req=33b3d75e;err=Cover.Close failed
+```
+
+### Why This Matters
+
+The receiver **scans the decoded stream** and extracts only valid frames by:
+
+* locating `~ ... #`
+* validating `LEN`
+* validating `CHK`
+
+This works even if:
+
+* the event contains extra garbage
+* multiple frames arrive in one event
+* one frame is partially corrupted
 
 ---
 
 ## Communication Flow
 
 ```
-MASTER                              SLAVE
-  │                                   │
-  │  CMD (CO-OP / CO-CL, req)         │
-  ├──────────────────────────────────▶│
-  │                                   │
-  │        ACK (burst)                │
-  │◀──────────────────────────────────┤
-  │                                   │
-  │        DONE (burst)               │
-  │◀──────────────────────────────────┤
+MASTER                                   SLAVE
+  │                                        │
+  │ CMD (CO-OP / CO-CL, req)               │
+  ├───────────────────────────────────────▶│
+  │                                        │
+  │ ACK burst (3x)                          │
+  │◀───────────────────────────────────────┤
+  │                                        │
+  │ SLAVE executes Cover.Open / Cover.Close │
+  │ (poll Cover.GetStatus until final state)│
+  │                                        │
+  │ DONE burst (3x)                         │
+  │◀───────────────────────────────────────┤
 ```
 
 ---
 
-## Design Decisions
+## Reliability Strategy
 
-### 1. Single TX from MASTER
+### 1) MASTER “single-flight” (no concurrency)
 
-The MASTER:
+The MASTER handles **one pending command at a time**:
 
-* sends the command **once**
-* immediately switches to RX mode
-* avoids TX/RX collisions inherent to LoRa
+* prevents request overwrites and timer races
+* avoids ambiguous state updates
 
-### 2. Burst ACK/DONE from SLAVE
+If a button is pressed while an operation is pending, the command is ignored (logged).
 
-The SLAVE:
+### 2) Resend if no ACK
 
-* sends ACK and DONE multiple times
-* mitigates packet loss during RX windows
+If no `ACK` is received within `RESEND_IF_NO_ACK_MS`, the MASTER resends the *same* command using the *same* `req` (idempotent), up to `MAX_RESENDS`.
 
-### 3. Deduplication on SLAVE
+### 3) Burst ACK/DONE on SLAVE
 
-If a `CMD` with the same `req` is received again:
+The SLAVE sends both `ACK` and `DONE` multiple times to mitigate packet loss during LoRa RX windows.
 
-* execution is skipped
-* ACK/DONE are re-sent
+### 4) Idempotency (dedup on SLAVE)
 
-This guarantees **idempotent behavior**.
+If the SLAVE receives the same `req` again:
 
-### 4. Real State Confirmation
+* it **does not re-execute** the valve action
+* it **re-sends ACK/DONE**, ensuring state convergence
 
-`DONE` is sent **only after**:
+### 5) Real state confirmation
 
-* querying `Cover.GetStatus`
-* confirming `open` or `closed`
+`DONE` is sent only after the SLAVE verifies the final state via `Cover.GetStatus`:
 
-No optimistic assumptions.
+* `open`
+* `closed`
 
 ---
 
-## Code Structure
+## Configuration
 
-### MASTER Script Responsibilities
+### MASTER Key Parameters
 
-* Handle Virtual Button events
-* Generate `CMD` messages
-* Maintain pending command state
-* Receive `ACK` / `DONE`
-* Update `boolean:200`
-* Optional RPC functions:
+| Setting               | Meaning                                           |
+| --------------------- | ------------------------------------------------- |
+| `LORA_SLAVE_ID`       | LoRa ID of the SLAVE                              |
+| `TIMEOUT_MS`          | Max time window for the command                   |
+| `RESEND_IF_NO_ACK_MS` | Resend delay if no ACK                            |
+| `MAX_RESENDS`         | Number of resends (total sends = 1 + MAX_RESENDS) |
+| `VC_OPEN_BTN_ID`      | Virtual button for OPEN                           |
+| `VC_CLOSE_BTN_ID`     | Virtual button for CLOSE                          |
+| `VC_STATE_BOOL_ID`    | Virtual boolean for state                         |
 
-  * `valveOpen()`
-  * `valveClose()`
+### SLAVE Key Parameters
 
-### SLAVE Script Responsibilities
-
-* Receive `CMD`
-* Deduplicate requests
-* Send ACK burst
-* Execute valve command
-* Poll valve state
-* Send DONE burst
+| Setting                              | Meaning                       |
+| ------------------------------------ | ----------------------------- |
+| `COVER_ID`                           | Cover instance id (usually 0) |
+| `DONE_TIMEOUT_MS`                    | Max time to reach final state |
+| `ACK_RETRIES` / `DONE_RETRIES`       | Burst count                   |
+| `ACK_SPACING_MS` / `DONE_SPACING_MS` | Burst spacing                 |
+| `SEEN_TTL_MS`                        | Dedup window for request IDs  |
 
 ---
 
-## Configuration Parameters
+## File Layout
 
-### MASTER
+Typical project directory:
 
-```js
-LORA_SLAVE_ID
-TIMEOUT_MS
+```text
+Remote-Valve-Control/
+├── README.md
+├── master.js
+└── slave.js
 ```
-
-### SLAVE
-
-```js
-COVER_ID
-ACK_RETRIES
-ACK_SPACING_MS
-DONE_RETRIES
-DONE_SPACING_MS
-DONE_TIMEOUT_MS
-```
-
-All parameters are centralized and easily tunable.
 
 ---
 
 ## Usage
 
-1. Flash MASTER script
-2. Create Virtual Components
-3. Flash SLAVE script
-4. Configure correct LoRa IDs
-5. Control valve directly from Shelly App
+1. Upload `slave.js` to the remote Shelly (SLAVE)
+2. Upload `master.js` to the local Shelly (MASTER)
+3. Create Virtual Components on MASTER:
 
-No cloud services required.
+   * `button:200` (Open)
+   * `button:201` (Close)
+   * `boolean:200` (Valve State)
+4. Ensure LoRa IDs are correctly configured:
 
----
-
-## Limitations
-
-* No encryption (payload is plaintext + checksum)
-* Single valve per SLAVE
-* Single MASTER ↔ SLAVE link
+   * MASTER uses `LORA_SLAVE_ID` = SLAVE ID
+5. Control the valve via the Shelly App (Virtual Buttons)
 
 ---
 
-## Possible Extensions
+## Known Limitations
 
-* Payload encryption
-* Multi-valve support
-* Multiple SLAVEs per MASTER
-* Watchdog / heartbeat
-* State recovery after reboot
-* QoS statistics (RSSI, SNR logging)
+* No encryption/authentication (checksum is integrity-only, not security)
+* Designed for a single MASTER ↔ single SLAVE link
+* Single valve per SLAVE (Cover ID configurable)
 
 ---
 
-## Contributing
+## Suggested Improvements / Roadmap
 
-Contributions are welcome.
-
-This project was built from a real field requirement and intentionally kept simple, transparent, and extensible.
-
-PRs, issues, and protocol improvements are encouraged.
+* Optional payload encryption / signing
+* Multi-slave support on MASTER
+* Queue mode (store one pending command instead of ignoring presses)
+* Heartbeat/status telemetry (RSSI/SNR sampling)
+* Persisted state recovery after reboot
 
 ---
 
 ## License
 
 MIT License
-
-Use, modify, and redistribute freely.
