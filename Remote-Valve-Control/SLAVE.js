@@ -1,8 +1,8 @@
 /*
  * SLAVE - Shelly 2 Gen3 + LoRa
- * - Riceve CO-OP/CO-CL
- * - ACK burst + DONE burst
- * - DEDUP su req
+ * - Robust framing: ~LEN:PAYLOAD|CHK#
+ * - Dedup on req (idempotent)
+ * - ACK + DONE burst (anti loss)
  */
 
 let CFG = {
@@ -16,6 +16,10 @@ let CFG = {
 
   DONE_RETRIES: 3,
   DONE_SPACING_MS: 700,
+
+  START: "~",
+  END: "#",
+  MAX_DECODE_LEN: 512,
 };
 
 let seen = {};
@@ -23,7 +27,7 @@ let SEEN_TTL_MS = 60000;
 
 function log() { if (CFG.DEBUG) print.apply(null, arguments); }
 
-function checksumHex(s) {
+function xorChecksumHex(s) {
   let c = 0;
   for (let i = 0; i < s.length; i++) c ^= s.charCodeAt(i);
   let h = c.toString(16).toUpperCase();
@@ -31,55 +35,105 @@ function checksumHex(s) {
   return h.slice(-4);
 }
 
-function pack(obj) {
-  let body = JSON.stringify(obj);
-  return JSON.stringify({ body: body, chk: checksumHex(body) });
+function encodePayload(obj) {
+  let parts = [];
+  parts.push("t=" + obj.t);
+  if (obj.cmd !== undefined) parts.push("cmd=" + obj.cmd);
+  parts.push("req=" + obj.req);
+  if (obj.ok !== undefined) parts.push("ok=" + (obj.ok ? "1" : "0"));
+  if (obj.state !== undefined) parts.push("state=" + obj.state);
+  if (obj.err !== undefined) parts.push("err=" + obj.err);
+  return parts.join(";");
 }
 
-function unpack(str) {
-  let outer = JSON.parse(str);
-  if (!outer || !outer.body || !outer.chk) throw "outer missing fields";
-  if (checksumHex(outer.body) !== outer.chk) throw "checksum mismatch";
-  return JSON.parse(outer.body);
+function decodePayload(payload) {
+  let o = {};
+  let parts = payload.split(";");
+  for (let i = 0; i < parts.length; i++) {
+    let kv = parts[i].split("=");
+    if (kv.length < 2) continue;
+    let k = kv[0];
+    let v = kv.slice(1).join("=");
+    o[k] = v;
+  }
+  if (o.ok !== undefined) o.ok = (o.ok === "1" || o.ok === "true");
+  return o;
+}
+
+function makeFrame(payload) {
+  let len = payload.length;
+  let chk = xorChecksumHex(payload);
+  return CFG.START + len + ":" + payload + "|" + chk + CFG.END;
+}
+
+function extractFrames(decoded) {
+  let frames = [];
+  if (!decoded) return frames;
+  if (decoded.length > CFG.MAX_DECODE_LEN) decoded = decoded.slice(0, CFG.MAX_DECODE_LEN);
+
+  let s = decoded;
+  let idx = 0;
+
+  while (true) {
+    let a = s.indexOf(CFG.START, idx);
+    if (a < 0) break;
+    let b = s.indexOf(CFG.END, a + 1);
+    if (b < 0) break;
+
+    let candidate = s.slice(a + 1, b); // LEN:PAYLOAD|CHK
+    let colon = candidate.indexOf(":");
+    let pipe = candidate.lastIndexOf("|");
+    if (colon < 0 || pipe < 0 || pipe < colon) { idx = b + 1; continue; }
+
+    let lenStr = candidate.slice(0, colon);
+    let payload = candidate.slice(colon + 1, pipe);
+    let chk = candidate.slice(pipe + 1);
+
+    let len = parseInt(lenStr, 10);
+    if (!isFinite(len) || len < 1 || len > 400) { idx = b + 1; continue; }
+    if (payload.length !== len) { idx = b + 1; continue; }
+
+    let expected = xorChecksumHex(payload);
+    if (chk !== expected) { idx = b + 1; continue; }
+
+    frames.push(payload);
+    idx = b + 1;
+  }
+
+  return frames;
+}
+
+function loraSend(destId, obj) {
+  let payload = encodePayload(obj);
+  let frame = makeFrame(payload);
+
+  Shelly.call("Lora.SendBytes", { id: destId, data: btoa(frame) }, function (_, ec, em) {
+    if (ec !== 0) log("❌ LoRa TX FAIL destId=", destId, "t=", obj.t, "req=", obj.req, "ec=", ec, "em=", em);
+    else log("✅ LoRa TX OK  destId=", destId, "t=", obj.t, "req=", obj.req);
+  });
+}
+
+function burstSend(destId, obj, count, spacingMs) {
+  for (let i = 0; i < count; i++) {
+    (function (k) {
+      Timer.set(k * spacingMs, false, function () { loraSend(destId, obj); });
+    })(i);
+  }
+}
+
+function ack(destId, req) { burstSend(destId, { t: "ACK", req: req }, CFG.ACK_RETRIES, CFG.ACK_SPACING_MS); }
+function done(destId, req, ok, state) { burstSend(destId, { t: "DONE", req: req, ok: !!ok, state: state || "" }, CFG.DONE_RETRIES, CFG.DONE_SPACING_MS); }
+function err(destId, req, msg) { burstSend(destId, { t: "ERR", req: req, err: msg || "unknown" }, CFG.DONE_RETRIES, CFG.DONE_SPACING_MS); }
+
+function cleanupSeen() {
+  let now = Date.now();
+  for (let k in seen) if (now - seen[k] > SEEN_TTL_MS) delete seen[k];
 }
 
 function cmdLabel(cmd) {
   if (cmd === "CO-OP") return "APERTURA";
   if (cmd === "CO-CL") return "CHIUSURA";
   return cmd;
-}
-
-function loraSend(destId, msgObj) {
-  let payload = pack(msgObj);
-  Shelly.call("Lora.SendBytes", { id: destId, data: btoa(payload) }, function (_, ec, em) {
-    if (ec !== 0) log("❌ LoRa TX FAIL destId=", destId, "type=", msgObj.t, "req=", msgObj.req, "ec=", ec, "em=", em);
-    else log("✅ LoRa TX OK  destId=", destId, "type=", msgObj.t, "req=", msgObj.req);
-  });
-}
-
-function burstSend(destId, msgObj, count, spacingMs) {
-  for (let i = 0; i < count; i++) {
-    (function (k) {
-      Timer.set(k * spacingMs, false, function () { loraSend(destId, msgObj); });
-    })(i);
-  }
-}
-
-function ack(destId, req) {
-  burstSend(destId, { t: "ACK", req: req }, CFG.ACK_RETRIES, CFG.ACK_SPACING_MS);
-}
-
-function done(destId, req, ok, state) {
-  burstSend(destId, { t: "DONE", req: req, ok: !!ok, state: state || "" }, CFG.DONE_RETRIES, CFG.DONE_SPACING_MS);
-}
-
-function err(destId, req, msg) {
-  burstSend(destId, { t: "ERR", req: req, err: msg || "unknown" }, CFG.DONE_RETRIES, CFG.DONE_SPACING_MS);
-}
-
-function cleanupSeen() {
-  let now = Date.now();
-  for (let k in seen) if (now - seen[k] > SEEN_TTL_MS) delete seen[k];
 }
 
 function waitCoverState(destId, req, targetState, label) {
@@ -148,17 +202,17 @@ function handleCmd(senderId, cmd, req) {
 Shelly.addEventHandler(function (event) {
   if (!event || !event.info || !event.info.data) return;
 
-  let raw;
-  try { raw = atob(event.info.data); }
-  catch (e) { log("❌ atob failed:", e); return; }
+  let decoded;
+  try { decoded = atob(event.info.data); } catch (e) { return; }
 
-  let msg;
-  try { msg = unpack(raw); }
-  catch (e) { log("❌ unpack failed:", e, "raw=", raw.slice(0, 160)); return; }
+  let payloads = extractFrames(decoded);
+  if (payloads.length === 0) return;
 
-  if (!msg || msg.t !== "CMD" || !msg.cmd || !msg.req) return;
-
-  handleCmd(event.id, msg.cmd, msg.req);
+  for (let i = 0; i < payloads.length; i++) {
+    let msg = decodePayload(payloads[i]);
+    if (!msg || msg.t !== "CMD" || !msg.cmd || !msg.req) continue;
+    handleCmd(event.id, msg.cmd, msg.req);
+  }
 });
 
 log("🚀 SLAVE pronto.");
