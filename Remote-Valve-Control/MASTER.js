@@ -1,24 +1,40 @@
 /*
- * MASTER - Shelly Gen3 + LoRa + Virtual Components
- * button:200 -> OPEN
- * button:201 -> CLOSE
- * boolean:200 -> Stato (true=open, false=closed)
+ * MASTER - Shelly Gen3 + LoRa (ROBUST)
+ * - Virtual Buttons: button:200 OPEN, button:201 CLOSE
+ * - Virtual Boolean: boolean:200 state (true=open, false=closed)
+ * - Robust framing: ~LEN:PAYLOAD|CHK#
+ * - RX decoder extracts valid frames even if concatenated/corrupted
+ * - FIX: no crash timers (closure req/t0), lock while pending
+ * - FIX: resend if no ACK within X ms (same req)
  */
 
 let CFG = {
   LORA_SLAVE_ID: 102,
-  TIMEOUT_MS: 60000,
+
+  // command lifecycle
+  TIMEOUT_MS: 60000,               // total time window
+  RESEND_IF_NO_ACK_MS: 7000,       // if no ACK after 7s -> resend
+  MAX_RESENDS: 2,                  // total sends = 1 + MAX_RESENDS
+  IGNORE_WHILE_PENDING: true,      // avoid concurrent requests
+
   DEBUG: true,
 
+  // Virtual Components
   VC_OPEN_BTN_ID: 200,
   VC_CLOSE_BTN_ID: 201,
   VC_STATE_BOOL_ID: 200,
+
+  // Framing
+  START: "~",
+  END: "#",
+  MAX_DECODE_LEN: 512,
 };
 
 function log() { if (CFG.DEBUG) print.apply(null, arguments); }
 function nowMs() { return Date.now(); }
 
-function checksumHex(s) {
+// ===== Checksum (XOR) =====
+function xorChecksumHex(s) {
   let c = 0;
   for (let i = 0; i < s.length; i++) c ^= s.charCodeAt(i);
   let h = c.toString(16).toUpperCase();
@@ -26,17 +42,104 @@ function checksumHex(s) {
   return h.slice(-4);
 }
 
-function pack(obj) {
-  let body = JSON.stringify(obj);
-  return JSON.stringify({ body: body, chk: checksumHex(body) });
+// ===== Payload (key=value;...) =====
+function encodePayload(obj) {
+  let parts = [];
+  parts.push("t=" + obj.t);
+  if (obj.cmd !== undefined) parts.push("cmd=" + obj.cmd);
+  parts.push("req=" + obj.req);
+  if (obj.ok !== undefined) parts.push("ok=" + (obj.ok ? "1" : "0"));
+  if (obj.state !== undefined) parts.push("state=" + obj.state);
+  if (obj.err !== undefined) parts.push("err=" + obj.err);
+  return parts.join(";");
 }
 
-function unpack(str) {
-  let outer = JSON.parse(str);
-  if (!outer || !outer.body || !outer.chk) return null;
-  if (checksumHex(outer.body) !== outer.chk) return null;
-  return JSON.parse(outer.body);
+function decodePayload(payload) {
+  let o = {};
+  let parts = payload.split(";");
+  for (let i = 0; i < parts.length; i++) {
+    let kv = parts[i].split("=");
+    if (kv.length < 2) continue;
+    let k = kv[0];
+    let v = kv.slice(1).join("=");
+    o[k] = v;
+  }
+  if (o.ok !== undefined) o.ok = (o.ok === "1" || o.ok === "true");
+  return o;
 }
+
+// ===== Framing =====
+// frame: ~<LEN>:<PAYLOAD>|<CHK>#
+function makeFrame(payload) {
+  let len = payload.length;
+  let chk = xorChecksumHex(payload);
+  return CFG.START + len + ":" + payload + "|" + chk + CFG.END;
+}
+
+function extractFrames(decoded) {
+  let frames = [];
+  if (!decoded) return frames;
+  if (decoded.length > CFG.MAX_DECODE_LEN) decoded = decoded.slice(0, CFG.MAX_DECODE_LEN);
+
+  let s = decoded;
+  let idx = 0;
+
+  while (true) {
+    let a = s.indexOf(CFG.START, idx);
+    if (a < 0) break;
+    let b = s.indexOf(CFG.END, a + 1);
+    if (b < 0) break;
+
+    let candidate = s.slice(a + 1, b); // LEN:PAYLOAD|CHK
+    let colon = candidate.indexOf(":");
+    let pipe = candidate.lastIndexOf("|");
+    if (colon < 0 || pipe < 0 || pipe < colon) { idx = b + 1; continue; }
+
+    let lenStr = candidate.slice(0, colon);
+    let payload = candidate.slice(colon + 1, pipe);
+    let chk = candidate.slice(pipe + 1);
+
+    let len = parseInt(lenStr, 10);
+    if (!isFinite(len) || len < 1 || len > 400) { idx = b + 1; continue; }
+    if (payload.length !== len) { idx = b + 1; continue; }
+
+    let expected = xorChecksumHex(payload);
+    if (chk !== expected) { idx = b + 1; continue; }
+
+    frames.push(payload);
+    idx = b + 1;
+  }
+
+  return frames;
+}
+
+// ===== LoRa TX =====
+function loraSend(destId, obj) {
+  let payload = encodePayload(obj);
+  let frame = makeFrame(payload);
+
+  Shelly.call("Lora.SendBytes", { id: destId, data: btoa(frame) }, function (_, ec, em) {
+    if (ec !== 0) log("❌ TX FAIL dest=", destId, "ec=", ec, "em=", em);
+    else log("✅ TX OK ->", destId, "t=", obj.t, "cmd=", obj.cmd || "", "req=", obj.req);
+  });
+}
+
+// ===== Virtual Boolean setter =====
+function setValveStateBool(isOpen) {
+  Shelly.call("Boolean.Set", { id: CFG.VC_STATE_BOOL_ID, value: !!isOpen }, function (_, ec, em) {
+    if (ec !== 0) log("❌ Boolean.Set failed:", ec, em);
+    else log("🟢 boolean:200 =", isOpen ? "true (open)" : "false (closed)");
+  });
+}
+
+// ===== Pending (single-flight) =====
+let pending = null;
+// pending = {
+//   req, cmd, label, t0,
+//   ackReceived: bool,
+//   sendCount: int,
+//   timeoutTimer, resendTimer
+// }
 
 function cmdLabel(cmd) {
   if (cmd === "CO-OP") return "APERTURA";
@@ -44,113 +147,149 @@ function cmdLabel(cmd) {
   return cmd;
 }
 
-function loraSendOnce(destId, msgObj) {
-  let payload = pack(msgObj);
-  Shelly.call("Lora.SendBytes", { id: destId, data: btoa(payload) }, function (_, ec, em) {
-    if (ec !== 0) log("❌ TX FAIL dest=", destId, "ec=", ec, "em=", em);
-    else log("✅ TX OK ->", destId, "cmd=", msgObj.cmd, "req=", msgObj.req);
-  });
-}
-
-// === Virtual Boolean setter ===
-function setValveStateBool(isOpen) {
-  // boolean:200 => true=open, false=closed
-  Shelly.call("Boolean.Set", { id: CFG.VC_STATE_BOOL_ID, value: !!isOpen }, function (_, ec, em) {
-    if (ec !== 0) log("❌ Boolean.Set failed:", ec, em);
-    else log("🟢 Stato elettrovalvola aggiornato ->", isOpen ? "APERTO (true)" : "CHIUSO (false)");
-  });
-}
-
-let pending = null; // { req, cmd, t0, timer }
-
 function clearPending(reason) {
   if (!pending) return;
-  if (pending.timer) Timer.clear(pending.timer);
+  if (pending.timeoutTimer) Timer.clear(pending.timeoutTimer);
+  if (pending.resendTimer) Timer.clear(pending.resendTimer);
   log("🧹 Clear pending req=", pending.req, "reason=", reason);
   pending = null;
 }
 
+function scheduleResend(req) {
+  // use closure req, never read pending blindly
+  let localReq = req;
+
+  // if no pending or different req -> ignore
+  if (!pending || pending.req !== localReq) return;
+
+  // already have ACK -> do not resend
+  if (pending.ackReceived) return;
+
+  // reached max resends
+  if (pending.sendCount > CFG.MAX_RESENDS) return;
+
+  pending.resendTimer = Timer.set(CFG.RESEND_IF_NO_ACK_MS, false, function () {
+    if (!pending || pending.req !== localReq) return;
+    if (pending.ackReceived) return;
+
+    pending.sendCount++;
+    log("🔁 Nessun ACK, ritrasmetto comando", pending.label,
+        "(resend", pending.sendCount, "di", (CFG.MAX_RESENDS + 1) + ")", "req=", pending.req);
+
+    loraSend(CFG.LORA_SLAVE_ID, { t: "CMD", cmd: pending.cmd, req: pending.req });
+
+    // schedule next resend if needed
+    scheduleResend(localReq);
+  });
+}
+
 function sendCommand(cmd) {
+  if (CFG.IGNORE_WHILE_PENDING && pending) {
+    log("⛔ Comando ignorato: operazione già in corso:", pending.label, "req=", pending.req);
+    return;
+  }
+
   let req = (Math.floor(Math.random() * 1e9)).toString(16);
   let label = cmdLabel(cmd);
   let t0 = nowMs();
 
-  pending = { req: req, cmd: cmd, t0: t0, timer: null };
+  pending = {
+    req: req,
+    cmd: cmd,
+    label: label,
+    t0: t0,
+    ackReceived: false,
+    sendCount: 0,
+    timeoutTimer: null,
+    resendTimer: null,
+  };
 
   log("🚩 START", label, "req=", req, "TIMEOUT_MS=", CFG.TIMEOUT_MS);
-  pending.timer = Timer.set(CFG.TIMEOUT_MS, false, function () {
-    log("⏱️ TIMEOUT", label, "req=", req, "elapsed(ms)=", (nowMs() - t0));
+
+  // timeout totale (closure: req + t0)
+  let localReq = req;
+  let localT0 = t0;
+
+  pending.timeoutTimer = Timer.set(CFG.TIMEOUT_MS, false, function () {
+    // if req changed or cleared, ignore
+    if (!pending || pending.req !== localReq) return;
+    log("⏱️ TIMEOUT", label, "req=", localReq, "elapsed(ms)=", (nowMs() - localT0));
     clearPending("timeout");
   });
 
-  log("➡️  Inviato comando", label, "(singolo)", "req=", req);
-  loraSendOnce(CFG.LORA_SLAVE_ID, { t: "CMD", cmd: cmd, req: req });
+  // initial send
+  pending.sendCount = 1;
+  log("➡️  Inviato comando", label, "(send 1)", "req=", req);
+  loraSend(CFG.LORA_SLAVE_ID, { t: "CMD", cmd: cmd, req: req });
+
+  // schedule resend if no ACK arrives
+  scheduleResend(req);
 }
 
-// Debug da RPC
+// Optional debug RPC
 function valveOpen()  { sendCommand("CO-OP"); }
 function valveClose() { sendCommand("CO-CL"); }
 
-// === Listener Virtual Buttons ===
-// Quando premi dall'app, il device genera un evento sul componente button:ID
+// ===== Virtual Buttons listener =====
 Shelly.addEventHandler(function (event) {
   if (!event || !event.info) return;
+  if (event.name !== "button") return;
+  if (event.id !== CFG.VC_OPEN_BTN_ID && event.id !== CFG.VC_CLOSE_BTN_ID) return;
 
-  // Filtra solo eventi button dei virtual components
-  // Tipicamente: event.name = "button" e event.id = <id>, event.info.event="single_push" / "pressed"
-  if (event.name === "button" && (event.id === CFG.VC_OPEN_BTN_ID || event.id === CFG.VC_CLOSE_BTN_ID)) {
-    let ev = event.info.event || "";
-    // accettiamo qualsiasi “push/press” per evitare rogne tra firmware
-    if (ev.indexOf("push") >= 0 || ev.indexOf("press") >= 0 || ev === "" ) {
-      if (event.id === CFG.VC_OPEN_BTN_ID) {
-        log("🟦 Virtual button:", CFG.VC_OPEN_BTN_ID, "-> APRI");
-        sendCommand("CO-OP");
-      } else if (event.id === CFG.VC_CLOSE_BTN_ID) {
-        log("🟧 Virtual button:", CFG.VC_CLOSE_BTN_ID, "-> CHIUDI");
-        sendCommand("CO-CL");
-      }
-    }
+  // Many firmwares use: single_push / pressed / on. Keep permissive.
+  if (event.id === CFG.VC_OPEN_BTN_ID) {
+    log("🟦 VC button:200 -> OPEN");
+    sendCommand("CO-OP");
+  } else {
+    log("🟧 VC button:201 -> CLOSE");
+    sendCommand("CO-CL");
   }
 });
 
-// === RX LoRa (ACK/DONE/ERR) ===
+// ===== LoRa RX: decode base64 -> extract frames -> handle messages =====
 Shelly.addEventHandler(function (event) {
   if (!event || !event.info || !event.info.data) return;
 
   let decoded;
   try { decoded = atob(event.info.data); } catch (e) { return; }
 
-  let msg;
-  try { msg = unpack(decoded); } catch (e) { return; }
-  if (!msg || !msg.t || !msg.req) return;
+  let payloads = extractFrames(decoded);
+  if (payloads.length === 0) return;
 
-  if (!pending) return;
-  if (msg.req !== pending.req) return;
+  for (let i = 0; i < payloads.length; i++) {
+    let msg = decodePayload(payloads[i]);
+    if (!msg || !msg.t || !msg.req) continue;
 
-  let label = cmdLabel(pending.cmd);
-  let elapsed = nowMs() - pending.t0;
+    // Always log minimal RX
+    log("📡 RX t=", msg.t, "req=", msg.req, "fromId=", event.id);
 
-  if (msg.t === "ACK") {
-    log("📩 Ricevuta conferma RICEZIONE comando", label, "elapsed(ms)=", elapsed);
-    return;
-  }
+    if (!pending) continue;
+    if (msg.req !== pending.req) continue;
 
-  if (msg.t === "DONE") {
-    log("✅ Esecuzione completata:", label, "| ok=", msg.ok, "| state=", msg.state, "| elapsed(ms)=", elapsed);
+    let elapsed = nowMs() - pending.t0;
 
-    // Aggiorna boolean:200 in base allo stato finale
-    if (msg.state === "open") setValveStateBool(true);
-    if (msg.state === "closed") setValveStateBool(false);
+    if (msg.t === "ACK") {
+      pending.ackReceived = true;
+      log("📩 ACK ricevuto:", pending.label, "elapsed(ms)=", elapsed);
+      continue;
+    }
 
-    clearPending("done");
-    return;
-  }
+    if (msg.t === "DONE") {
+      log("✅ DONE:", pending.label, "ok=", msg.ok, "state=", msg.state, "elapsed(ms)=", elapsed);
 
-  if (msg.t === "ERR") {
-    log("💥 ERRORE da SLAVE:", msg.err, "|", label, "| elapsed(ms)=", elapsed);
-    clearPending("err");
-    return;
+      if (msg.state === "open") setValveStateBool(true);
+      if (msg.state === "closed") setValveStateBool(false);
+
+      clearPending("done");
+      continue;
+    }
+
+    if (msg.t === "ERR") {
+      log("💥 ERR:", pending.label, msg.err || "", "elapsed(ms)=", elapsed);
+      clearPending("err");
+      continue;
+    }
   }
 });
 
-log("🚀 MASTER pronto. Usa i Virtual Buttons 200/201 dall’app oppure valveOpen()/valveClose().");
+log("🚀 MASTER pronto. Usa Virtual Buttons 200/201 oppure valveOpen()/valveClose().");
