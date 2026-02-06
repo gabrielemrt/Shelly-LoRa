@@ -1,31 +1,29 @@
 /*
- * SLAVE - Shelly 2 Gen3 + LoRa
- * - Robust framing: ~LEN:PAYLOAD|CHK#
- * - Dedup on req (idempotent)
- * - ACK + DONE burst (anti loss)
+ * SLAVE – Shelly 2 Gen3 + LoRa
+ * Remote Valve Controller
+ * FIX: no timer leak, no reboot
  */
 
 let CFG = {
   COVER_ID: 0,
-  DONE_TIMEOUT_MS: 25000,
+
   POLL_MS: 500,
-  DEBUG: true,
+  DONE_TIMEOUT_MS: 30000,
 
   ACK_RETRIES: 3,
-  ACK_SPACING_MS: 700,
-
   DONE_RETRIES: 3,
-  DONE_SPACING_MS: 700,
+  SPACING_MS: 700,
 
   START: "~",
   END: "#",
   MAX_DECODE_LEN: 512,
+
+  DEBUG: true,
 };
 
-let seen = {};
-let SEEN_TTL_MS = 60000;
-
 function log() { if (CFG.DEBUG) print.apply(null, arguments); }
+
+/* ===== FRAMING ===== */
 
 function xorChecksumHex(s) {
   let c = 0;
@@ -35,184 +33,147 @@ function xorChecksumHex(s) {
   return h.slice(-4);
 }
 
-function encodePayload(obj) {
-  let parts = [];
-  parts.push("t=" + obj.t);
-  if (obj.cmd !== undefined) parts.push("cmd=" + obj.cmd);
-  parts.push("req=" + obj.req);
-  if (obj.ok !== undefined) parts.push("ok=" + (obj.ok ? "1" : "0"));
-  if (obj.state !== undefined) parts.push("state=" + obj.state);
-  if (obj.err !== undefined) parts.push("err=" + obj.err);
-  return parts.join(";");
+function encodePayload(o) {
+  let p = [];
+  p.push("t=" + o.t);
+  if (o.cmd) p.push("cmd=" + o.cmd);
+  p.push("req=" + o.req);
+  if (o.state) p.push("state=" + o.state);
+  if (o.ok !== undefined) p.push("ok=" + (o.ok ? "1" : "0"));
+  return p.join(";");
 }
 
-function decodePayload(payload) {
+function decodePayload(s) {
   let o = {};
-  let parts = payload.split(";");
-  for (let i = 0; i < parts.length; i++) {
-    let kv = parts[i].split("=");
-    if (kv.length < 2) continue;
-    let k = kv[0];
-    let v = kv.slice(1).join("=");
-    o[k] = v;
-  }
-  if (o.ok !== undefined) o.ok = (o.ok === "1" || o.ok === "true");
+  s.split(";").forEach(kv => {
+    let p = kv.split("=");
+    if (p.length >= 2) o[p[0]] = p.slice(1).join("=");
+  });
+  if (o.ok !== undefined) o.ok = (o.ok === "1");
   return o;
 }
 
 function makeFrame(payload) {
-  let len = payload.length;
-  let chk = xorChecksumHex(payload);
-  return CFG.START + len + ":" + payload + "|" + chk + CFG.END;
+  return CFG.START + payload.length + ":" + payload + "|" +
+         xorChecksumHex(payload) + CFG.END;
 }
 
-function extractFrames(decoded) {
-  let frames = [];
-  if (!decoded) return frames;
-  if (decoded.length > CFG.MAX_DECODE_LEN) decoded = decoded.slice(0, CFG.MAX_DECODE_LEN);
+function extractFrames(s) {
+  let out = [];
+  if (!s) return out;
+  if (s.length > CFG.MAX_DECODE_LEN) s = s.slice(0, CFG.MAX_DECODE_LEN);
 
-  let s = decoded;
-  let idx = 0;
-
+  let i = 0;
   while (true) {
-    let a = s.indexOf(CFG.START, idx);
+    let a = s.indexOf(CFG.START, i);
     if (a < 0) break;
-    let b = s.indexOf(CFG.END, a + 1);
+    let b = s.indexOf(CFG.END, a);
     if (b < 0) break;
 
-    let candidate = s.slice(a + 1, b); // LEN:PAYLOAD|CHK
-    let colon = candidate.indexOf(":");
-    let pipe = candidate.lastIndexOf("|");
-    if (colon < 0 || pipe < 0 || pipe < colon) { idx = b + 1; continue; }
+    let c = s.slice(a + 1, b);
+    let p1 = c.indexOf(":");
+    let p2 = c.lastIndexOf("|");
+    if (p1 < 0 || p2 < 0) { i = b + 1; continue; }
 
-    let lenStr = candidate.slice(0, colon);
-    let payload = candidate.slice(colon + 1, pipe);
-    let chk = candidate.slice(pipe + 1);
+    let len = parseInt(c.slice(0, p1), 10);
+    let payload = c.slice(p1 + 1, p2);
+    let chk = c.slice(p2 + 1);
 
-    let len = parseInt(lenStr, 10);
-    if (!isFinite(len) || len < 1 || len > 400) { idx = b + 1; continue; }
-    if (payload.length !== len) { idx = b + 1; continue; }
+    if (payload.length === len && xorChecksumHex(payload) === chk)
+      out.push(payload);
 
-    let expected = xorChecksumHex(payload);
-    if (chk !== expected) { idx = b + 1; continue; }
-
-    frames.push(payload);
-    idx = b + 1;
+    i = b + 1;
   }
-
-  return frames;
+  return out;
 }
 
-function loraSend(destId, obj) {
-  let payload = encodePayload(obj);
-  let frame = makeFrame(payload);
-
-  Shelly.call("Lora.SendBytes", { id: destId, data: btoa(frame) }, function (_, ec, em) {
-    if (ec !== 0) log("❌ LoRa TX FAIL destId=", destId, "t=", obj.t, "req=", obj.req, "ec=", ec, "em=", em);
-    else log("✅ LoRa TX OK  destId=", destId, "t=", obj.t, "req=", obj.req);
+function loraSend(dest, obj) {
+  Shelly.call("Lora.SendBytes", {
+    id: dest,
+    data: btoa(makeFrame(encodePayload(obj)))
   });
 }
 
-function burstSend(destId, obj, count, spacingMs) {
-  for (let i = 0; i < count; i++) {
-    (function (k) {
-      Timer.set(k * spacingMs, false, function () { loraSend(destId, obj); });
-    })(i);
+/* ===== SAFE BURST ===== */
+
+let burstBusy = false;
+
+function burst(dest, obj, count) {
+  if (burstBusy) return;
+  burstBusy = true;
+
+  let sent = 0;
+  function step() {
+    if (sent >= count) {
+      burstBusy = false;
+      return;
+    }
+    loraSend(dest, obj);
+    sent++;
+    Timer.set(CFG.SPACING_MS, false, step);
   }
+  step();
 }
 
-function ack(destId, req) { burstSend(destId, { t: "ACK", req: req }, CFG.ACK_RETRIES, CFG.ACK_SPACING_MS); }
-function done(destId, req, ok, state) { burstSend(destId, { t: "DONE", req: req, ok: !!ok, state: state || "" }, CFG.DONE_RETRIES, CFG.DONE_SPACING_MS); }
-function err(destId, req, msg) { burstSend(destId, { t: "ERR", req: req, err: msg || "unknown" }, CFG.DONE_RETRIES, CFG.DONE_SPACING_MS); }
+/* ===== VALVE ===== */
 
-function cleanupSeen() {
-  let now = Date.now();
-  for (let k in seen) if (now - seen[k] > SEEN_TTL_MS) delete seen[k];
-}
+let seen = {};
 
-function cmdLabel(cmd) {
-  if (cmd === "CO-OP") return "APERTURA";
-  if (cmd === "CO-CL") return "CHIUSURA";
-  return cmd;
-}
-
-function waitCoverState(destId, req, targetState, label) {
-  let t0 = Date.now();
+function waitForState(dest, req, target) {
+  let start = Date.now();
 
   function poll() {
-    Shelly.call("Cover.GetStatus", { id: CFG.COVER_ID }, function (st, ec, em) {
-      if (ec !== 0) { err(destId, req, "Cover.GetStatus failed: " + em); return; }
-
-      let state = (st && st.state) ? st.state : "unknown";
-
-      if (state === targetState) {
-        log("✅ Elettrovalvola:", label, "COMPLETATA (state=", state + ")", "req=", req);
-        done(destId, req, true, state);
+    Shelly.call("Cover.GetStatus", { id: CFG.COVER_ID }, st => {
+      if (st.state === target) {
+        burst(dest, { t: "DONE", req, ok: true, state: target }, CFG.DONE_RETRIES);
         return;
       }
-
-      if (Date.now() - t0 > CFG.DONE_TIMEOUT_MS) {
-        log("⏱️ Timeout completamento:", label, "(state attuale=", state + ")", "req=", req);
-        done(destId, req, false, state);
+      if (Date.now() - start > CFG.DONE_TIMEOUT_MS) {
+        burst(dest, { t: "DONE", req, ok: false, state: st.state }, CFG.DONE_RETRIES);
         return;
       }
-
       Timer.set(CFG.POLL_MS, false, poll);
     });
   }
-
   poll();
 }
 
-function handleCmd(senderId, cmd, req) {
-  cleanupSeen();
+/* ===== RX ===== */
 
-  if (seen[req] && (Date.now() - seen[req] < SEEN_TTL_MS)) {
-    log("↩️ Duplicate req:", req, "| cmd=", cmdLabel(cmd), "— ritrasmetto ACK");
-    ack(senderId, req);
-    return;
-  }
-  seen[req] = Date.now();
-
-  let label = cmdLabel(cmd);
-  log("📩 Ricevuto comando", label, "req=", req, "| senderId=", senderId, "— invio ACK burst");
-  ack(senderId, req);
-
-  if (cmd === "CO-OP") {
-    Shelly.call("Cover.Open", { id: CFG.COVER_ID }, function (_, ec, em) {
-      if (ec !== 0) { err(senderId, req, "Cover.Open failed: " + em); return; }
-      log("▶️  Avviata APERTURA, attendo stato open… req=", req);
-      waitCoverState(senderId, req, "open", "APERTURA");
-    });
-    return;
-  }
-
-  if (cmd === "CO-CL") {
-    Shelly.call("Cover.Close", { id: CFG.COVER_ID }, function (_, ec, em) {
-      if (ec !== 0) { err(senderId, req, "Cover.Close failed: " + em); return; }
-      log("▶️  Avviata CHIUSURA, attendo stato closed… req=", req);
-      waitCoverState(senderId, req, "closed", "CHIUSURA");
-    });
-    return;
-  }
-
-  err(senderId, req, "Unknown cmd: " + cmd);
-}
-
-Shelly.addEventHandler(function (event) {
-  if (!event || !event.info || !event.info.data) return;
+Shelly.addEventHandler(function (e) {
+  if (!e?.info?.data) return;
 
   let decoded;
-  try { decoded = atob(event.info.data); } catch (e) { return; }
+  try { decoded = atob(e.info.data); } catch { return; }
 
-  let payloads = extractFrames(decoded);
-  if (payloads.length === 0) return;
+  extractFrames(decoded).forEach(p => {
+    let m = decodePayload(p);
 
-  for (let i = 0; i < payloads.length; i++) {
-    let msg = decodePayload(payloads[i]);
-    if (!msg || msg.t !== "CMD" || !msg.cmd || !msg.req) continue;
-    handleCmd(event.id, msg.cmd, msg.req);
-  }
+    if (m.t === "PING") {
+      loraSend(e.id, { t: "PONG", req: m.req });
+      return;
+    }
+
+    if (m.t === "CMD" && m.cmd && m.req) {
+      if (seen[m.req]) {
+        burst(e.id, { t: "ACK", req: m.req }, CFG.ACK_RETRIES);
+        return;
+      }
+      seen[m.req] = true;
+
+      burst(e.id, { t: "ACK", req: m.req }, CFG.ACK_RETRIES);
+
+      if (m.cmd === "CO-OP") {
+        Shelly.call("Cover.Open", { id: CFG.COVER_ID });
+        waitForState(e.id, m.req, "open");
+      }
+
+      if (m.cmd === "CO-CL") {
+        Shelly.call("Cover.Close", { id: CFG.COVER_ID });
+        waitForState(e.id, m.req, "closed");
+      }
+    }
+  });
 });
 
-log("🚀 SLAVE pronto.");
+log("🚀 SLAVE pronto – FIX TIMER LEAK");
